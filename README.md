@@ -60,8 +60,8 @@ sudo ./scripts/setup-artix-chroot.sh /srv/chroots/artix
 The script:
 
 1. Downloads or reuses the cached ISO under `/var/cache/vps-setup/artix/`.
-2. Verifies it with the SHA256 published on the Artix downloads page, falling
-   back to the detached Artix PGP signature when necessary.
+2. Verifies weekly images against the `sha256sums` manifest published in the
+   same Artix ISO directory. The general downloads page is used as a fallback.
 3. Mounts the ISO and detects the actual root filesystem image.
 4. Copies the root tree while preserving numeric ownership, hard links, ACLs,
    extended attributes, devices, and special files.
@@ -88,6 +88,10 @@ sudo ./scripts/setup-artix-chroot.sh \
   --iso-url https://example.invalid/artix-base-runit.iso \
   --cache-dir /srv/iso-cache \
   /srv/chroots/artix
+
+# Supply a trusted published hash manually if metadata servers are unavailable.
+sudo ARTIX_ISO_SHA256=<64-character-sha256> \
+  ./scripts/setup-artix-chroot.sh /srv/chroots/artix
 ```
 
 The target must be an absolute path. The script refuses `/`, `/dev`, `/proc`,
