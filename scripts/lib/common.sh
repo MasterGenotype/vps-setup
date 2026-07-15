@@ -38,11 +38,17 @@ save_setting() {
     fi
 }
 
+# Persisted settings only fill in variables that aren't already set, so
+# explicit environment overrides (sudo WG_PORT=443 ./...) always win.
 load_settings() {
-    if [[ -r ${SETTINGS_FILE} ]]; then
-        # shellcheck disable=SC1090
-        . "${SETTINGS_FILE}"
-    fi
+    [[ -r ${SETTINGS_FILE} ]] || return 0
+    local key value
+    while IFS='=' read -r key value; do
+        [[ ${key} =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+        if [[ -z ${!key+set} ]]; then
+            printf -v "${key}" '%s' "${value}"
+        fi
+    done < "${SETTINGS_FILE}"
 }
 
 # Default route's interface, e.g. eth0 / ens3.

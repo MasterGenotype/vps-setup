@@ -8,21 +8,27 @@
 # - Watches the WAN interface; HOME_NET = server IP + WireGuard subnets
 # - Fetches the free ET Open ruleset (suricata-update) and refreshes it
 #   daily via a systemd timer
-# - IDS mode (default): passive detection, alerts to /var/log/suricata/
-# - IPS mode (opt-in): inline via NFQUEUE — packets matching 'drop' rules
-#   are blocked. SSH is never queued (no lockouts) and the queue is
-#   fail-open (--queue-bypass), so traffic keeps flowing if Suricata stops.
+# - IDPS mode (default): inline detection + prevention via NFQUEUE — all
+#   rules alert, and a conservative set of high-confidence categories
+#   (trojan-activity, exploit-kit, command-and-control) is dropped
+# - IPS mode: inline, but blocks only the rules you mark as 'drop' in
+#   /etc/suricata/drop.conf (starts blocking nothing)
+# - IDS mode: passive detection only, alerts to /var/log/suricata/
 #
-# Idempotent: safe to re-run, including to switch modes.
+# In the inline modes SSH is never queued (no lockouts) and the queue is
+# fail-open (--queue-bypass), so traffic keeps flowing if Suricata stops.
+#
+# Idempotent: safe to re-run, including to switch modes. The chosen mode
+# persists in vps-setup.env, so re-runs keep it unless you override.
 #
 # Configuration (override via environment or /etc/wireguard/vps-setup.env):
-#   SURICATA_MODE      ids | ips              (default: ids)
+#   SURICATA_MODE      idps | ips | ids       (default: idps)
 #   SURICATA_IFACE     interface to monitor   (default: WAN interface)
 #   SURICATA_HOME_NET  HOME_NET override      (default: auto-detected)
 #
 # Usage:
 #   sudo ./setup-suricata.sh
-#   sudo SURICATA_MODE=ips ./setup-suricata.sh
+#   sudo SURICATA_MODE=ids ./setup-suricata.sh    # detect-only, block nothing
 #   sudo SURICATA_IFACE=wg0 ./setup-suricata.sh   # watch tunnel traffic instead
 
 set -euo pipefail
@@ -31,13 +37,27 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # shellcheck source=lib/common.sh
 . "${SCRIPT_DIR}/lib/common.sh"
 
+# Any unexpected failure should say exactly where it happened instead of
+# stopping silently (set -e otherwise exits without a message).
+trap 'die "setup-suricata.sh failed at line ${LINENO}: ${BASH_COMMAND}"' ERR
+
 require_root
 require_ubuntu
-load_settings
 
-SURICATA_MODE="${SURICATA_MODE:-ids}"
-[[ ${SURICATA_MODE} == "ids" || ${SURICATA_MODE} == "ips" ]] \
-    || die "SURICATA_MODE must be 'ids' or 'ips' (got: '${SURICATA_MODE}')"
+mode_source="default"
+if [[ -n ${SURICATA_MODE:-} ]]; then
+    mode_source="environment override"
+fi
+load_settings
+if [[ ${mode_source} == "default" && -n ${SURICATA_MODE:-} ]]; then
+    mode_source="persisted in ${SETTINGS_FILE}"
+fi
+
+SURICATA_MODE="${SURICATA_MODE:-idps}"
+case "${SURICATA_MODE}" in
+    ids|ips|idps) ;;
+    *) die "SURICATA_MODE must be 'ids', 'ips' or 'idps' (got: '${SURICATA_MODE}')" ;;
+esac
 
 SURICATA_YAML="/etc/suricata/suricata.yaml"
 NFQUEUE_HELPER="/usr/local/sbin/suricata-nfqueue-rules"
@@ -85,7 +105,7 @@ else
     HOME_NET="[$(IFS=,; printf '%s' "${nets[*]}")]"
 fi
 
-log "Mode      : ${SURICATA_MODE}"
+log "Mode      : ${SURICATA_MODE} (${mode_source})"
 log "Interface : ${SURICATA_IFACE}"
 log "HOME_NET  : ${HOME_NET}"
 
@@ -100,24 +120,44 @@ sed -i "0,/^\( *- interface:\).*/s//\1 ${SURICATA_IFACE}/" "${SURICATA_YAML}"
 # Community flow IDs make it easy to correlate events with other tools.
 sed -i "s/^\( *community-id:\) false/\1 true/" "${SURICATA_YAML}"
 
-# The Debian/OISF packaging reads the capture mode from /etc/default/suricata.
-if [[ ${SURICATA_MODE} == "ips" ]]; then
-    LISTENMODE="nfqueue"
-else
+# Select the capture mode: af-packet (passive) for IDS, NFQUEUE (inline)
+# otherwise. Packagings launch the daemon differently, so instead of
+# assuming a config file, take the service's own ExecStart, swap just the
+# capture option, and apply it via a systemd drop-in.
+if [[ ${SURICATA_MODE} == "ids" ]]; then
     LISTENMODE="af-packet"
+    CAPTURE_OPT="--af-packet"
+else
+    LISTENMODE="nfqueue"
+    CAPTURE_OPT="-q 0"
 fi
+
+# Older Debian packagings also read these; keep them in sync where present.
 if [[ -f /etc/default/suricata ]]; then
     sed -i "s/^LISTENMODE=.*/LISTENMODE=${LISTENMODE}/" /etc/default/suricata
     sed -i "s/^IFACE=.*/IFACE=${SURICATA_IFACE}/" /etc/default/suricata
-elif [[ ${SURICATA_MODE} == "ips" ]]; then
-    die "/etc/default/suricata not found — this packaging can't switch to nfqueue (IPS) mode"
 fi
 
-# ------------------------------------------------- IPS mode (NFQUEUE rules)
+exec_start="$(systemctl cat suricata.service 2>/dev/null \
+    | sed -n 's/^ExecStart=//p' | awk 'NF' | tail -n1 || true)"
+[[ -n ${exec_start} ]] || die "Could not read ExecStart from suricata.service — is the package installed?"
+exec_start="$(sed -E 's/ --af-packet(=[^ ]*)?//g; s/ -q [0-9]+//g' <<< "${exec_start}") ${CAPTURE_OPT}"
+
+log "Capture mode: ${LISTENMODE}"
+mkdir -p /etc/systemd/system/suricata.service.d
+cat > /etc/systemd/system/suricata.service.d/vps-setup.conf <<EOF
+# Managed by vps-setup/scripts/setup-suricata.sh — selects the capture mode.
+[Service]
+ExecStart=
+ExecStart=${exec_start}
+EOF
+systemctl daemon-reload
+
+# ---------------------------------------- inline modes (NFQUEUE diversion)
 # A small helper inserts/removes the iptables rules that divert traffic to
 # Suricata's queue, and a systemd unit ties its lifetime to suricata.service.
-if [[ ${SURICATA_MODE} == "ips" ]]; then
-    SSH_PORT="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')"
+if [[ ${SURICATA_MODE} != "ids" ]]; then
+    SSH_PORT="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}' || true)"
     SSH_PORT="${SSH_PORT:-22}"
     log "Setting up NFQUEUE diversion (SSH port ${SSH_PORT} exempt, fail-open)"
 
@@ -178,24 +218,43 @@ ExecStop=${NFQUEUE_HELPER} down
 WantedBy=suricata.service
 EOF
     systemctl daemon-reload
-    systemctl enable suricata-nfqueue.service >/dev/null 2>&1
+    systemctl enable suricata-nfqueue.service >/dev/null 2>&1 \
+        || die "Failed to enable suricata-nfqueue.service"
 
-    # In IPS mode only rules whose action is 'drop' block traffic; everything
-    # else still just alerts. drop.conf tells suricata-update which alert
-    # rules to convert. Ship a template, never overwrite the user's choices.
+    # In the inline modes only rules whose action is 'drop' block traffic;
+    # everything else still just alerts. drop.conf tells suricata-update
+    # which alert rules to convert. Ship a template, never overwrite the
+    # user's choices.
     if [[ ! -f /etc/suricata/drop.conf ]]; then
         cat > /etc/suricata/drop.conf <<'EOF'
 # Rules matched here are converted from 'alert' to 'drop' by suricata-update,
-# so they actively block traffic in IPS mode. One pattern per line: a
+# so they actively block traffic in IPS/IDPS mode. One pattern per line: a
 # signature ID, "gid:sid", or re:<regex> matched against the whole rule.
 # After editing, apply with:
 #   sudo systemctl start suricata-update.service
 #
-# Conservative starting points (uncomment to enable):
+# Conservative starting points (enabled automatically in IDPS mode):
 #re:trojan-activity
 #re:exploit-kit
 #re:command-and-control
 EOF
+    fi
+
+    # IDPS mode = detection + prevention out of the box: make sure the
+    # conservative high-confidence categories are active (uncomment them if
+    # the template shipped them commented, append them if absent). Anything
+    # the user added or removed by hand elsewhere in the file is untouched.
+    if [[ ${SURICATA_MODE} == "idps" ]]; then
+        for pattern in 're:trojan-activity' 're:exploit-kit' 're:command-and-control'; do
+            if grep -qxF "${pattern}" /etc/suricata/drop.conf; then
+                continue
+            elif grep -qxF "#${pattern}" /etc/suricata/drop.conf; then
+                sed -i "s|^#${pattern}\$|${pattern}|" /etc/suricata/drop.conf
+            else
+                printf '%s\n' "${pattern}" >> /etc/suricata/drop.conf
+            fi
+        done
+        log "Prevention enabled for: trojan-activity, exploit-kit, command-and-control"
     fi
 else
     # Switching back to IDS: remove any NFQUEUE diversion from a previous run.
@@ -271,6 +330,15 @@ systemctl enable suricata >/dev/null 2>&1
 systemctl restart suricata
 systemctl is-active --quiet suricata || die "suricata failed to start — see: journalctl -u suricata"
 
+if [[ ${SURICATA_MODE} != "ids" ]]; then
+    systemctl start suricata-nfqueue.service
+    systemctl is-active --quiet suricata-nfqueue.service \
+        || die "NFQUEUE diversion failed — see: journalctl -u suricata-nfqueue"
+    iptables -C FORWARD -j NFQUEUE --queue-num 0 --queue-bypass 2>/dev/null \
+        || die "NFQUEUE rules missing from iptables — see: journalctl -u suricata-nfqueue"
+    log "Inline diversion active (NFQUEUE, fail-open, SSH exempt)"
+fi
+
 # --------------------------------------------------------------- settings
 save_setting SURICATA_MODE "${SURICATA_MODE}"
 save_setting SURICATA_IFACE "${SURICATA_IFACE}"
@@ -279,4 +347,7 @@ log "Suricata is up in ${SURICATA_MODE^^} mode on ${SURICATA_IFACE} (rule loadin
 log "Alerts: sudo ./suricata-alerts.sh   |   logs: /var/log/suricata/{fast.log,eve.json}"
 if [[ ${SURICATA_MODE} == "ips" ]]; then
     log "IPS note: only rules marked 'drop' block traffic — edit /etc/suricata/drop.conf to choose."
+elif [[ ${SURICATA_MODE} == "idps" ]]; then
+    log "IDPS note: trojan-activity, exploit-kit and command-and-control rules are dropped;"
+    log "everything else alerts. Tune /etc/suricata/drop.conf, then: systemctl start suricata-update"
 fi
