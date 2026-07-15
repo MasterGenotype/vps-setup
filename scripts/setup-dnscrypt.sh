@@ -9,6 +9,7 @@
 #
 # Configuration (override via environment or /etc/wireguard/vps-setup.env):
 #   DNSCRYPT_VERSION          pinned upstream release      (default: 2.1.17)
+#   MINISIGN_VERSION          source-built verifier        (default: 0.12)
 #   DNSCRYPT_SERVER_NAMES     comma-separated resolvers    (default: automatic)
 #   DNSCRYPT_IPV6_UPSTREAM    use IPv6 upstream resolvers  (default: 0)
 #   DNSCRYPT_REQUIRE_DNSSEC   require DNSSEC               (default: 1)
@@ -30,6 +31,7 @@ require_ubuntu
 load_settings
 
 DNSCRYPT_VERSION="${DNSCRYPT_VERSION:-2.1.17}"
+MINISIGN_VERSION="${MINISIGN_VERSION:-0.12}"
 DNSCRYPT_SERVER_NAMES="${DNSCRYPT_SERVER_NAMES:-}"
 DNSCRYPT_IPV6_UPSTREAM="${DNSCRYPT_IPV6_UPSTREAM:-0}"
 DNSCRYPT_REQUIRE_DNSSEC="${DNSCRYPT_REQUIRE_DNSSEC:-1}"
@@ -44,10 +46,11 @@ DNSCRYPT_STATE="/var/lib/dnscrypt-proxy"
 DNSCRYPT_CONFIG="${DNSCRYPT_ETC}/dnscrypt-proxy.toml"
 DNSCRYPT_SERVICE="/etc/systemd/system/dnscrypt-proxy.service"
 DNSCRYPT_SIGNING_KEY="RWTk1xXqcTODeYttYMCMLo0YJHaFEHn7a3akqHlb/7QvIQXHVPxKbjB5"
+MINISIGN_BIN=""
 
-TMP_DIR=""
+TMP_DIR="$(mktemp -d)"
 cleanup() {
-    [[ -z ${TMP_DIR} ]] || rm -rf -- "${TMP_DIR}"
+    rm -rf -- "${TMP_DIR}"
 }
 trap cleanup EXIT
 trap 'die "setup-dnscrypt.sh failed at line ${LINENO}: ${BASH_COMMAND}"' ERR
@@ -60,6 +63,37 @@ bool_toml() {
     esac
 }
 
+build_minisign() {
+    local source_archive source_dir build_dir
+
+    if command -v minisign >/dev/null 2>&1; then
+        MINISIGN_BIN="$(command -v minisign)"
+        return 0
+    fi
+
+    log "Minisign is unavailable from Ubuntu 22.04 APT; building ${MINISIGN_VERSION} from source"
+    apt-get install -yq build-essential cmake pkg-config libsodium-dev
+
+    source_archive="${TMP_DIR}/minisign-${MINISIGN_VERSION}.tar.gz"
+    curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+        --output "${source_archive}" \
+        "https://github.com/jedisct1/minisign/archive/refs/tags/${MINISIGN_VERSION}.tar.gz"
+
+    tar -xzf "${source_archive}" -C "${TMP_DIR}"
+    source_dir="$(find "${TMP_DIR}" -mindepth 1 -maxdepth 1 -type d \
+        -name 'minisign-*' -print -quit)"
+    [[ -n ${source_dir} ]] || die "Could not locate extracted Minisign source"
+
+    build_dir="${source_dir}/build"
+    cmake -S "${source_dir}" -B "${build_dir}" -DCMAKE_BUILD_TYPE=MinSizeRel
+    cmake --build "${build_dir}" --parallel "$(nproc)"
+    MINISIGN_BIN="/usr/local/bin/minisign"
+    install -m 0755 "${build_dir}/minisign" "${MINISIGN_BIN}"
+
+    "${MINISIGN_BIN}" -v >/dev/null 2>&1 \
+        || die "The source-built Minisign binary failed its version check"
+}
+
 DNSCRYPT_IPV6_UPSTREAM_TOML="$(bool_toml "${DNSCRYPT_IPV6_UPSTREAM}")"
 DNSCRYPT_REQUIRE_DNSSEC_TOML="$(bool_toml "${DNSCRYPT_REQUIRE_DNSSEC}")"
 DNSCRYPT_REQUIRE_NOLOG_TOML="$(bool_toml "${DNSCRYPT_REQUIRE_NOLOG}")"
@@ -67,6 +101,8 @@ DNSCRYPT_REQUIRE_NOFILTER_TOML="$(bool_toml "${DNSCRYPT_REQUIRE_NOFILTER}")"
 
 [[ ${DNSCRYPT_VERSION} =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] \
     || die "Invalid DNSCRYPT_VERSION: '${DNSCRYPT_VERSION}'"
+[[ ${MINISIGN_VERSION} =~ ^[0-9]+\.[0-9]+([.][0-9]+)?$ ]] \
+    || die "Invalid MINISIGN_VERSION: '${MINISIGN_VERSION}'"
 
 systemctl is-active --quiet "wg-quick@${WG_INTERFACE}" \
     || die "wg-quick@${WG_INTERFACE} is not active — run setup-wireguard.sh first"
@@ -88,17 +124,7 @@ export DEBIAN_FRONTEND=noninteractive
 log "Installing DNSCrypt-Proxy dependencies"
 apt-get update -q
 apt-get install -yq ca-certificates curl tar dnsutils
-
-if ! command -v minisign >/dev/null 2>&1; then
-    if ! apt-get install -yq minisign; then
-        log "Enabling Ubuntu Universe for minisign"
-        apt-get install -yq software-properties-common
-        add-apt-repository -y universe
-        apt-get update -q
-        apt-get install -yq minisign
-    fi
-fi
-command -v minisign >/dev/null 2>&1 || die "minisign was not installed"
+build_minisign
 
 # -------------------------------------------------------- signed upstream build
 case "$(dpkg --print-architecture)" in
@@ -109,7 +135,6 @@ esac
 
 ASSET="dnscrypt-proxy-linux_${RELEASE_ARCH}-${DNSCRYPT_VERSION}.tar.gz"
 RELEASE_URL="https://github.com/DNSCrypt/dnscrypt-proxy/releases/download/${DNSCRYPT_VERSION}"
-TMP_DIR="$(mktemp -d)"
 ARCHIVE="${TMP_DIR}/${ASSET}"
 SIGNATURE="${ARCHIVE}.minisig"
 
@@ -120,7 +145,8 @@ curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
     --output "${SIGNATURE}" "${RELEASE_URL}/${ASSET}.minisig"
 
 log "Verifying upstream Minisign signature"
-minisign -Vm "${ARCHIVE}" -x "${SIGNATURE}" -P "${DNSCRYPT_SIGNING_KEY}" >/dev/null
+"${MINISIGN_BIN}" -Vm "${ARCHIVE}" -x "${SIGNATURE}" \
+    -P "${DNSCRYPT_SIGNING_KEY}" >/dev/null
 
 tar -xzf "${ARCHIVE}" -C "${TMP_DIR}"
 EXTRACTED_BIN="$(find "${TMP_DIR}" -type f -name dnscrypt-proxy -print -quit)"
