@@ -2,8 +2,8 @@
 #
 # bootstrap.sh — one-shot setup of a fresh Ubuntu VPS as an encrypted
 # tunnel (WireGuard VPN) server, with basic hardening, intrusion
-# detection & prevention (Suricata IDPS), and initial client configs
-# for a computer and a phone.
+# detection & prevention (Suricata IDPS), encrypted DNS (dnscrypt-proxy),
+# and initial client configs for a computer and a phone.
 #
 # Usage (on the VPS, as root):
 #   git clone <this-repo> && cd vps-setup
@@ -12,6 +12,7 @@
 # Skip pieces:
 #   sudo NO_CLIENTS=1 ./bootstrap.sh    # no initial device configs
 #   sudo NO_SURICATA=1 ./bootstrap.sh   # no intrusion detection/prevention
+#   sudo NO_DNSCRYPT=1 ./bootstrap.sh   # no encrypted DNS proxy
 
 set -euo pipefail
 
@@ -22,6 +23,11 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 
 if [[ -z ${NO_SURICATA:-} ]]; then
     "${SCRIPT_DIR}/scripts/setup-suricata.sh"
+fi
+
+# Before add-client so the initial devices get the tunnel DNS baked in.
+if [[ -z ${NO_DNSCRYPT:-} ]]; then
+    "${SCRIPT_DIR}/scripts/setup-dnscrypt.sh"
 fi
 
 if [[ -z ${NO_CLIENTS:-} ]]; then

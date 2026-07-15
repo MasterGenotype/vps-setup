@@ -33,7 +33,11 @@ This runs the full pipeline:
    as an intrusion detection & prevention system (IDPS) inspecting traffic
    inline, with the free ET Open ruleset refreshed daily. Skip with
    `NO_SURICATA=1`, or run detect-only with `SURICATA_MODE=ids`.
-4. **`scripts/add-client.sh computer`** and **`... phone`** — creates two
+4. **`scripts/setup-dnscrypt.sh`** — installs
+   [dnscrypt-proxy](https://github.com/DNSCrypt/dnscrypt-proxy) so the
+   server and all VPN devices resolve DNS through encrypted, no-log
+   resolvers instead of plaintext port 53. Skip with `NO_DNSCRYPT=1`.
+5. **`scripts/add-client.sh computer`** and **`... phone`** — creates two
    initial device configs. The phone's QR code is printed to the terminal.
 
 ### Connect your phone
@@ -71,6 +75,30 @@ sudo ./scripts/add-client.sh work --split   # split tunnel: only VPN subnet rout
 sudo ./scripts/list-clients.sh              # devices + last handshake times
 sudo ./scripts/remove-client.sh tablet      # revoke a device immediately
 ```
+
+## Encrypted DNS (dnscrypt-proxy)
+
+`setup-dnscrypt.sh` runs dnscrypt-proxy on the server, listening on
+loopback and on the WireGuard tunnel IPs (e.g. `10.8.0.1`). Upstream
+resolution uses DNSCrypt/DNS-over-HTTPS to no-log resolvers, picked
+automatically by latency — or pin your own:
+
+```bash
+sudo DNSCRYPT_SERVERS=quad9-dnscrypt-ip4-filter-pri ./scripts/setup-dnscrypt.sh
+```
+
+How it fits the tunnel: client configs get `DNS = 10.8.0.1` (the server's
+tunnel address), so every lookup travels inside WireGuard to the VPS and
+leaves it encrypted — your DNS is hidden from local networks, your ISP,
+and the VPS's network too. The script updates the persisted `WG_DNS` (new
+clients pick it up automatically) and rewrites existing client configs —
+**already-connected devices must re-import their config** (`list-clients.sh
+--qr <name>` for phones, re-copy the `.conf` for computers).
+
+The server's own lookups go through the proxy as well (via
+systemd-resolved), but only after the script has verified the proxy
+answers a live query — a failed install can't break the host's DNS. Port
+53 is opened on the WireGuard interface only, never publicly.
 
 ## Intrusion detection / prevention (Suricata)
 
@@ -154,6 +182,12 @@ And for `setup-suricata.sh`:
 | `SURICATA_IFACE`    | WAN interface  | Interface to monitor (e.g. `wg0`)    |
 | `SURICATA_HOME_NET` | auto-detected  | Suricata `HOME_NET` override         |
 
+And for `setup-dnscrypt.sh`:
+
+| Variable           | Default   | Purpose                                     |
+| ------------------ | --------- | ------------------------------------------- |
+| `DNSCRYPT_SERVERS` | automatic | Pin specific resolvers (comma-separated names from the [public list](https://dnscrypt.info/public-servers)) |
+
 Example — run on port 443 with Quad9 DNS:
 
 ```bash
@@ -172,6 +206,7 @@ scripts/
   harden.sh                  # unattended-upgrades, fail2ban, SSH lockdown
   setup-suricata.sh          # Suricata IDS/IPS install & configuration
   suricata-alerts.sh         # readable view of recent/live IDS alerts
+  setup-dnscrypt.sh          # encrypted DNS (dnscrypt-proxy) for host + VPN
   add-client.sh              # add a device (config + QR code)
   remove-client.sh           # revoke a device
   list-clients.sh            # status / re-print QR codes
@@ -198,3 +233,5 @@ them is safe.
   traffic by default. Blocking is designed to fail open — SSH is never
   filtered and traffic flows normally if Suricata stops — so it can never
   cut you off. Detect-only: `SURICATA_MODE=ids`.
+- DNS queries never leave the VPS in plaintext: devices resolve through the
+  tunnel to dnscrypt-proxy, which speaks DNSCrypt/DoH to no-log resolvers.
