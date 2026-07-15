@@ -39,7 +39,15 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 
 require_root
 require_ubuntu
+
+mode_source="default"
+if [[ -n ${SURICATA_MODE:-} ]]; then
+    mode_source="environment override"
+fi
 load_settings
+if [[ ${mode_source} == "default" && -n ${SURICATA_MODE:-} ]]; then
+    mode_source="persisted in ${SETTINGS_FILE}"
+fi
 
 SURICATA_MODE="${SURICATA_MODE:-idps}"
 case "${SURICATA_MODE}" in
@@ -93,7 +101,7 @@ else
     HOME_NET="[$(IFS=,; printf '%s' "${nets[*]}")]"
 fi
 
-log "Mode      : ${SURICATA_MODE}"
+log "Mode      : ${SURICATA_MODE} (${mode_source})"
 log "Interface : ${SURICATA_IFACE}"
 log "HOME_NET  : ${HOME_NET}"
 
@@ -206,7 +214,8 @@ ExecStop=${NFQUEUE_HELPER} down
 WantedBy=suricata.service
 EOF
     systemctl daemon-reload
-    systemctl enable suricata-nfqueue.service >/dev/null 2>&1
+    systemctl enable suricata-nfqueue.service >/dev/null 2>&1 \
+        || die "Failed to enable suricata-nfqueue.service"
 
     # In the inline modes only rules whose action is 'drop' block traffic;
     # everything else still just alerts. drop.conf tells suricata-update
@@ -316,6 +325,15 @@ log "Enabling and starting suricata"
 systemctl enable suricata >/dev/null 2>&1
 systemctl restart suricata
 systemctl is-active --quiet suricata || die "suricata failed to start — see: journalctl -u suricata"
+
+if [[ ${SURICATA_MODE} != "ids" ]]; then
+    systemctl start suricata-nfqueue.service
+    systemctl is-active --quiet suricata-nfqueue.service \
+        || die "NFQUEUE diversion failed — see: journalctl -u suricata-nfqueue"
+    iptables -C FORWARD -j NFQUEUE --queue-num 0 --queue-bypass 2>/dev/null \
+        || die "NFQUEUE rules missing from iptables — see: journalctl -u suricata-nfqueue"
+    log "Inline diversion active (NFQUEUE, fail-open, SSH exempt)"
+fi
 
 # --------------------------------------------------------------- settings
 save_setting SURICATA_MODE "${SURICATA_MODE}"
