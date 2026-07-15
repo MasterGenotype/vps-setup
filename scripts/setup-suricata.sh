@@ -108,18 +108,38 @@ sed -i "0,/^\( *- interface:\).*/s//\1 ${SURICATA_IFACE}/" "${SURICATA_YAML}"
 # Community flow IDs make it easy to correlate events with other tools.
 sed -i "s/^\( *community-id:\) false/\1 true/" "${SURICATA_YAML}"
 
-# The Debian/OISF packaging reads the capture mode from /etc/default/suricata.
+# Select the capture mode: af-packet (passive) for IDS, NFQUEUE (inline)
+# otherwise. Packagings launch the daemon differently, so instead of
+# assuming a config file, take the service's own ExecStart, swap just the
+# capture option, and apply it via a systemd drop-in.
 if [[ ${SURICATA_MODE} == "ids" ]]; then
     LISTENMODE="af-packet"
+    CAPTURE_OPT="--af-packet"
 else
     LISTENMODE="nfqueue"
+    CAPTURE_OPT="-q 0"
 fi
+
+# Older Debian packagings also read these; keep them in sync where present.
 if [[ -f /etc/default/suricata ]]; then
     sed -i "s/^LISTENMODE=.*/LISTENMODE=${LISTENMODE}/" /etc/default/suricata
     sed -i "s/^IFACE=.*/IFACE=${SURICATA_IFACE}/" /etc/default/suricata
-elif [[ ${SURICATA_MODE} != "ids" ]]; then
-    die "/etc/default/suricata not found — this packaging can't switch to nfqueue (${SURICATA_MODE^^}) mode"
 fi
+
+exec_start="$(systemctl cat suricata.service 2>/dev/null \
+    | sed -n 's/^ExecStart=//p' | awk 'NF' | tail -n1)"
+[[ -n ${exec_start} ]] || die "Could not read ExecStart from suricata.service — is the package installed?"
+exec_start="$(sed -E 's/ --af-packet(=[^ ]*)?//g; s/ -q [0-9]+//g' <<< "${exec_start}") ${CAPTURE_OPT}"
+
+log "Capture mode: ${LISTENMODE}"
+mkdir -p /etc/systemd/system/suricata.service.d
+cat > /etc/systemd/system/suricata.service.d/vps-setup.conf <<EOF
+# Managed by vps-setup/scripts/setup-suricata.sh — selects the capture mode.
+[Service]
+ExecStart=
+ExecStart=${exec_start}
+EOF
+systemctl daemon-reload
 
 # ---------------------------------------- inline modes (NFQUEUE diversion)
 # A small helper inserts/removes the iptables rules that divert traffic to
