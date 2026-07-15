@@ -37,6 +37,10 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # shellcheck source=lib/common.sh
 . "${SCRIPT_DIR}/lib/common.sh"
 
+# Any unexpected failure should say exactly where it happened instead of
+# stopping silently (set -e otherwise exits without a message).
+trap 'die "setup-suricata.sh failed at line ${LINENO}: ${BASH_COMMAND}"' ERR
+
 require_root
 require_ubuntu
 
@@ -135,7 +139,7 @@ if [[ -f /etc/default/suricata ]]; then
 fi
 
 exec_start="$(systemctl cat suricata.service 2>/dev/null \
-    | sed -n 's/^ExecStart=//p' | awk 'NF' | tail -n1)"
+    | sed -n 's/^ExecStart=//p' | awk 'NF' | tail -n1 || true)"
 [[ -n ${exec_start} ]] || die "Could not read ExecStart from suricata.service — is the package installed?"
 exec_start="$(sed -E 's/ --af-packet(=[^ ]*)?//g; s/ -q [0-9]+//g' <<< "${exec_start}") ${CAPTURE_OPT}"
 
@@ -153,7 +157,7 @@ systemctl daemon-reload
 # A small helper inserts/removes the iptables rules that divert traffic to
 # Suricata's queue, and a systemd unit ties its lifetime to suricata.service.
 if [[ ${SURICATA_MODE} != "ids" ]]; then
-    SSH_PORT="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')"
+    SSH_PORT="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}' || true)"
     SSH_PORT="${SSH_PORT:-22}"
     log "Setting up NFQUEUE diversion (SSH port ${SSH_PORT} exempt, fail-open)"
 
