@@ -21,6 +21,8 @@ DEFAULT_ISO_URL="https://download.artixlinux.org/weekly-iso/artix-base-runit-202
 DOWNLOAD_PAGE_URL="https://artixlinux.org/download.php"
 CACHE_DIR="${ARTIX_ISO_CACHE_DIR:-/var/cache/vps-setup/artix}"
 ISO_URL="${ARTIX_ISO_URL:-${DEFAULT_ISO_URL}}"
+ISO_SHA256="${ARTIX_ISO_SHA256:-}"
+HTTP_USER_AGENT="${ARTIX_HTTP_USER_AGENT:-Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36}"
 REFRESH=0
 FORCE=0
 MODE="setup"
@@ -56,6 +58,8 @@ Options:
 Environment overrides:
   ARTIX_ISO_URL
   ARTIX_ISO_CACHE_DIR
+  ARTIX_ISO_SHA256
+  ARTIX_HTTP_USER_AGENT
 USAGE
 }
 
@@ -134,24 +138,26 @@ download_file() {
     if [[ -s ${partial} ]]; then
         log "Resuming partial download: ${partial}"
         curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
-            --retry-delay 2 --continue-at - --output "${partial}" "${url}"
+            --retry-delay 2 --user-agent "${HTTP_USER_AGENT}" \
+            --continue-at - --output "${partial}" "${url}"
     else
         curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
-            --retry-delay 2 --output "${partial}" "${url}"
+            --retry-delay 2 --user-agent "${HTTP_USER_AGENT}" \
+            --output "${partial}" "${url}"
     fi
     mv -f -- "${partial}" "${destination}"
 }
 
-checksum_from_download_page() {
-    local iso_name="$1" page_file checksum
-    page_file="${WORK_DIR}/artix-download.html"
+checksum_from_url() {
+    local source_url="$1" iso_name="$2" destination="$3" checksum
 
     if ! curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
-        --output "${page_file}" "${DOWNLOAD_PAGE_URL}"; then
+        --retry-delay 2 --user-agent "${HTTP_USER_AGENT}" \
+        --output "${destination}" "${source_url}"; then
         return 1
     fi
 
-    checksum="$(grep -Eo "[[:xdigit:]]{64}[[:space:]]+${iso_name//./\\.}" "${page_file}" \
+    checksum="$(grep -Eo "[[:xdigit:]]{64}[[:space:]]+${iso_name//./\\.}" "${destination}" \
         | awk 'NR == 1 {print tolower($1)}')"
     [[ ${checksum} =~ ^[0-9a-f]{64}$ ]] || return 1
     printf '%s' "${checksum}"
@@ -159,19 +165,45 @@ checksum_from_download_page() {
 
 verify_iso() {
     local iso_path="$1" iso_name="$2" sig_path="$3"
-    local expected actual gpg_home
+    local expected actual gpg_home checksum_source manifest_url
 
-    expected="$(checksum_from_download_page "${iso_name}" || true)"
+    manifest_url="${ISO_URL%/*}/sha256sums"
+    checksum_source=""
+
+    if [[ -n ${ISO_SHA256} ]]; then
+        expected="${ISO_SHA256,,}"
+        [[ ${expected} =~ ^[0-9a-f]{64}$ ]] \
+            || die "ARTIX_ISO_SHA256 must contain exactly 64 hexadecimal characters"
+        checksum_source="ARTIX_ISO_SHA256"
+    else
+        expected="$(checksum_from_url "${manifest_url}" "${iso_name}" \
+            "${WORK_DIR}/sha256sums" || true)"
+        if [[ -n ${expected} ]]; then
+            checksum_source="${manifest_url}"
+        else
+            expected="$(checksum_from_url "${DOWNLOAD_PAGE_URL}" "${iso_name}" \
+                "${WORK_DIR}/artix-download.html" || true)"
+            if [[ -n ${expected} ]]; then
+                checksum_source="${DOWNLOAD_PAGE_URL}"
+            fi
+        fi
+    fi
+
     if [[ -n ${expected} ]]; then
         actual="$(sha256sum "${iso_path}" | awk '{print $1}')"
         [[ ${actual} == "${expected}" ]] \
             || die "SHA256 mismatch for ${iso_name}: expected ${expected}, got ${actual}"
-        log "Verified ${iso_name} against the SHA256 published on the Artix downloads page"
+        log "Verified ${iso_name} using ${checksum_source}"
         return 0
     fi
 
-    warn "No matching SHA256 was found on ${DOWNLOAD_PAGE_URL}; trying the detached PGP signature"
+    if [[ ${ISO_URL} == */weekly-iso/* ]]; then
+        die "Could not obtain the weekly SHA256 for ${iso_name}. Tried ${manifest_url} and ${DOWNLOAD_PAGE_URL}. Set ARTIX_ISO_SHA256 to a trusted published checksum and re-run."
+    fi
+
+    warn "No matching SHA256 was found; trying the detached PGP signature"
     if ! curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+        --retry-delay 2 --user-agent "${HTTP_USER_AGENT}" \
         --output "${sig_path}" "${ISO_URL}.sig"; then
         die "Could not obtain a checksum or detached signature for ${iso_name}"
     fi
