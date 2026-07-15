@@ -74,6 +74,7 @@ VNC_HOME="$(getent passwd "${VNC_USER}" | cut -d: -f6)"
 
 # --------------------------------------------------------------- password
 mkdir -p "${VNC_HOME}/.vnc"
+chown "${VNC_USER}:${VNC_USER}" "${VNC_HOME}/.vnc"
 if [[ -f "${VNC_HOME}/.vnc/passwd" ]]; then
     log "Keeping existing VNC password (delete ${VNC_HOME}/.vnc/passwd to reset)"
 elif [[ -n ${VNC_PASSWORD:-} ]]; then
