@@ -88,26 +88,42 @@ sudo ./scripts/suricata-alerts.sh --follow   # live stream
 Raw logs live in `/var/log/suricata/` (`fast.log` for humans, `eve.json`
 for tooling), rotated daily and kept for a week.
 
-### IPS mode (inline blocking)
+### Inline modes: IPS and IDPS
 
-Re-run with `SURICATA_MODE=ips` to switch to prevention mode:
+Re-run the script with a different mode to switch (settings persist, and
+switching back to `ids` cleans up after the inline modes):
 
 ```bash
-sudo SURICATA_MODE=ips ./scripts/setup-suricata.sh
+sudo SURICATA_MODE=idps ./scripts/setup-suricata.sh   # detect + block defaults
+sudo SURICATA_MODE=ips  ./scripts/setup-suricata.sh   # detect + block only what you pick
+sudo SURICATA_MODE=ids  ./scripts/setup-suricata.sh   # back to detect-only
 ```
 
-Traffic is diverted through Suricata via NFQUEUE with two safety nets:
+| Mode   | Inline? | Blocks out of the box                                   |
+| ------ | ------- | ------------------------------------------------------- |
+| `ids`  | no      | nothing — detection only                                 |
+| `ips`  | yes     | nothing until you enable entries in `drop.conf`          |
+| `idps` | yes     | trojan-activity, exploit-kit, command-and-control rules |
+
+In both inline modes traffic is diverted through Suricata via NFQUEUE with
+two safety nets:
 
 - **Fail-open** — if Suricata stops, traffic flows normally instead of
   dropping (`--queue-bypass`).
 - **SSH exempt** — your SSH port is never queued, so a rule false-positive
   can't lock you out. UFW and fail2ban still apply to all traffic.
 
-In IPS mode only rules whose action is `drop` actually block traffic; the
-rest keep alerting. Choose what to drop in `/etc/suricata/drop.conf`
-(a commented template with conservative suggestions is installed), then
-apply with `sudo systemctl start suricata-update.service`. Switch back
-anytime with `sudo SURICATA_MODE=ids ./scripts/setup-suricata.sh`.
+Inline, only rules whose action is `drop` actually block traffic; the rest
+keep alerting (that's the "detection" half). What gets dropped is
+controlled by `/etc/suricata/drop.conf`: one pattern per line — a signature
+ID, `gid:sid`, or `re:<regex>`. `ips` installs it fully commented so you
+promote signatures yourself; `idps` activates the three conservative
+high-confidence categories above and leaves the rest of the file alone.
+After editing, apply with:
+
+```bash
+sudo systemctl start suricata-update.service
+```
 
 > Note: Suricata with the full ET Open ruleset is happiest with **2 GB+
 > RAM**. On a small VPS, skip it at bootstrap with `NO_SURICATA=1`.
@@ -131,7 +147,7 @@ And for `setup-suricata.sh`:
 
 | Variable            | Default        | Purpose                              |
 | ------------------- | -------------- | ------------------------------------ |
-| `SURICATA_MODE`     | `ids`          | `ids` (detect) or `ips` (block)      |
+| `SURICATA_MODE`     | `ids`          | `ids`, `ips` or `idps` (see below)   |
 | `SURICATA_IFACE`    | WAN interface  | Interface to monitor (e.g. `wg0`)    |
 | `SURICATA_HOME_NET` | auto-detected  | Suricata `HOME_NET` override         |
 
