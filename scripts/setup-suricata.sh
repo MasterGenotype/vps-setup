@@ -8,26 +8,27 @@
 # - Watches the WAN interface; HOME_NET = server IP + WireGuard subnets
 # - Fetches the free ET Open ruleset (suricata-update) and refreshes it
 #   daily via a systemd timer
-# - IDS mode (default): passive detection, alerts to /var/log/suricata/
-# - IPS mode (opt-in): inline via NFQUEUE — blocks only the rules you mark
-#   as 'drop' in /etc/suricata/drop.conf (starts blocking nothing)
-# - IDPS mode (opt-in): inline detection + prevention — like IPS, but a
-#   conservative set of high-confidence categories (trojan-activity,
-#   exploit-kit, command-and-control) is dropped out of the box
+# - IDPS mode (default): inline detection + prevention via NFQUEUE — all
+#   rules alert, and a conservative set of high-confidence categories
+#   (trojan-activity, exploit-kit, command-and-control) is dropped
+# - IPS mode: inline, but blocks only the rules you mark as 'drop' in
+#   /etc/suricata/drop.conf (starts blocking nothing)
+# - IDS mode: passive detection only, alerts to /var/log/suricata/
 #
 # In the inline modes SSH is never queued (no lockouts) and the queue is
 # fail-open (--queue-bypass), so traffic keeps flowing if Suricata stops.
 #
-# Idempotent: safe to re-run, including to switch modes.
+# Idempotent: safe to re-run, including to switch modes. The chosen mode
+# persists in vps-setup.env, so re-runs keep it unless you override.
 #
 # Configuration (override via environment or /etc/wireguard/vps-setup.env):
-#   SURICATA_MODE      ids | ips | idps       (default: ids)
+#   SURICATA_MODE      idps | ips | ids       (default: idps)
 #   SURICATA_IFACE     interface to monitor   (default: WAN interface)
 #   SURICATA_HOME_NET  HOME_NET override      (default: auto-detected)
 #
 # Usage:
 #   sudo ./setup-suricata.sh
-#   sudo SURICATA_MODE=idps ./setup-suricata.sh
+#   sudo SURICATA_MODE=ids ./setup-suricata.sh    # detect-only, block nothing
 #   sudo SURICATA_IFACE=wg0 ./setup-suricata.sh   # watch tunnel traffic instead
 
 set -euo pipefail
@@ -40,7 +41,7 @@ require_root
 require_ubuntu
 load_settings
 
-SURICATA_MODE="${SURICATA_MODE:-ids}"
+SURICATA_MODE="${SURICATA_MODE:-idps}"
 case "${SURICATA_MODE}" in
     ids|ips|idps) ;;
     *) die "SURICATA_MODE must be 'ids', 'ips' or 'idps' (got: '${SURICATA_MODE}')" ;;

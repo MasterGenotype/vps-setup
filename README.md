@@ -30,8 +30,9 @@ This runs the full pipeline:
    fail2ban for SSH, and (only if an SSH key is already installed) disables
    password login.
 3. **`scripts/setup-suricata.sh`** — installs [Suricata](https://suricata.io/)
-   as an intrusion detection system watching the WAN interface, with the
-   free ET Open ruleset refreshed daily. Skip with `NO_SURICATA=1`.
+   as an intrusion detection & prevention system (IDPS) inspecting traffic
+   inline, with the free ET Open ruleset refreshed daily. Skip with
+   `NO_SURICATA=1`, or run detect-only with `SURICATA_MODE=ids`.
 4. **`scripts/add-client.sh computer`** and **`... phone`** — creates two
    initial device configs. The phone's QR code is printed to the terminal.
 
@@ -73,11 +74,13 @@ sudo ./scripts/remove-client.sh tablet      # revoke a device immediately
 
 ## Intrusion detection / prevention (Suricata)
 
-`setup-suricata.sh` runs Suricata in **IDS mode** by default: it passively
-inspects traffic on the WAN interface and logs alerts — nothing is blocked.
-`HOME_NET` is set automatically to the server's public IP plus the WireGuard
-tunnel subnets. Rules (the free ET Open ruleset) are fetched at setup and
-refreshed daily by a systemd timer (`suricata-update.timer`).
+`setup-suricata.sh` runs Suricata in **IDPS mode** by default: traffic is
+inspected inline, every rule alerts, and a conservative set of
+high-confidence categories (trojan-activity, exploit-kit,
+command-and-control) is actively blocked. `HOME_NET` is set automatically
+to the server's public IP plus the WireGuard tunnel subnets. Rules (the
+free ET Open ruleset) are fetched at setup and refreshed daily by a systemd
+timer (`suricata-update.timer`).
 
 ```bash
 sudo ./scripts/suricata-alerts.sh            # last 20 alerts, one per line
@@ -88,22 +91,22 @@ sudo ./scripts/suricata-alerts.sh --follow   # live stream
 Raw logs live in `/var/log/suricata/` (`fast.log` for humans, `eve.json`
 for tooling), rotated daily and kept for a week.
 
-### Inline modes: IPS and IDPS
+### Modes
 
-Re-run the script with a different mode to switch (settings persist, and
-switching back to `ids` cleans up after the inline modes):
+Re-run the script with a different mode to switch (the choice persists,
+and switching to `ids` cleans up after the inline modes):
 
 ```bash
-sudo SURICATA_MODE=idps ./scripts/setup-suricata.sh   # detect + block defaults
+sudo SURICATA_MODE=idps ./scripts/setup-suricata.sh   # default: detect + block defaults
 sudo SURICATA_MODE=ips  ./scripts/setup-suricata.sh   # detect + block only what you pick
-sudo SURICATA_MODE=ids  ./scripts/setup-suricata.sh   # back to detect-only
+sudo SURICATA_MODE=ids  ./scripts/setup-suricata.sh   # detect-only, nothing inline
 ```
 
 | Mode   | Inline? | Blocks out of the box                                   |
 | ------ | ------- | ------------------------------------------------------- |
-| `ids`  | no      | nothing — detection only                                 |
-| `ips`  | yes     | nothing until you enable entries in `drop.conf`          |
 | `idps` | yes     | trojan-activity, exploit-kit, command-and-control rules |
+| `ips`  | yes     | nothing until you enable entries in `drop.conf`          |
+| `ids`  | no      | nothing — detection only                                 |
 
 In both inline modes traffic is diverted through Suricata via NFQUEUE with
 two safety nets:
@@ -147,7 +150,7 @@ And for `setup-suricata.sh`:
 
 | Variable            | Default        | Purpose                              |
 | ------------------- | -------------- | ------------------------------------ |
-| `SURICATA_MODE`     | `ids`          | `ids`, `ips` or `idps` (see below)   |
+| `SURICATA_MODE`     | `idps`         | `idps`, `ips` or `ids` (see below)   |
 | `SURICATA_IFACE`    | WAN interface  | Interface to monitor (e.g. `wg0`)    |
 | `SURICATA_HOME_NET` | auto-detected  | Suricata `HOME_NET` override         |
 
@@ -190,6 +193,8 @@ them is safe.
 - `remove-client.sh` revokes access immediately via `wg syncconf` — no
   restart, no disruption to other devices.
 - The firewall only exposes SSH and the WireGuard port.
-- Suricata watches for known-bad traffic (ET Open ruleset, auto-updated
-  daily). It starts in detect-only mode; blocking (IPS) is a deliberate
-  opt-in and is designed to fail open so it can never cut you off.
+- Suricata inspects traffic inline for known-bad patterns (ET Open ruleset,
+  auto-updated daily) and blocks high-confidence malware/C2/exploit-kit
+  traffic by default. Blocking is designed to fail open — SSH is never
+  filtered and traffic flows normally if Suricata stops — so it can never
+  cut you off. Detect-only: `SURICATA_MODE=ids`.
