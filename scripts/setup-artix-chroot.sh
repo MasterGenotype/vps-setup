@@ -127,7 +127,8 @@ install_host_dependencies() {
 }
 
 download_file() {
-    local url="$1" destination="$2" partial="${destination}.part"
+    local url="$1" destination="$2" partial
+    partial="${destination}.part"
 
     mkdir -p -- "$(dirname -- "${destination}")"
     if [[ -s ${partial} ]]; then
