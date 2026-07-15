@@ -92,6 +92,39 @@ sudo WG_PORT=443 WG_DNS=9.9.9.9,149.112.112.112 ./scripts/setup-wireguard.sh
 > Tip: if you're on a network that blocks unknown UDP ports, `WG_PORT=443`
 > often gets through.
 
+## Optional: remote desktop (VNC)
+
+`scripts/setup-vnc.sh` installs a lightweight XFCE desktop with TigerVNC so
+you can use a graphical desktop on the VPS from your phone or computer:
+
+```bash
+sudo ./scripts/setup-vnc.sh
+```
+
+You'll be prompted to choose a VNC password. VNC is never exposed to the
+open Internet — pick an access mode:
+
+- **`VNC_ACCESS=vpn`** (default): the firewall only admits the WireGuard
+  subnet. Turn the VPN on, install a VNC viewer app (e.g.
+  [AVNC](https://f-droid.org/packages/gaurav.avnc/) on Android, or RealVNC
+  Viewer), and connect to `10.8.0.1:5901`.
+- **`VNC_ACCESS=ssh`**: listens on localhost only; connect through an SSH
+  tunnel. From Termux on Android:
+
+  ```bash
+  pkg install openssh
+  ssh -L 5901:127.0.0.1:5901 <user>@YOUR_SERVER_IP
+  ```
+
+  Keep that running and point the VNC viewer app at `127.0.0.1:5901`.
+  (Termux only carries the tunnel — the desktop is displayed by the viewer
+  app.)
+
+Options: `VNC_USER` (desktop account, never root), `VNC_DISPLAY` (default
+`1` → port 5901), `VNC_GEOMETRY` (default `1280x720`), `VNC_DEPTH`,
+`VNC_PASSWORD` (skip the prompt). Manage with
+`sudo systemctl {status|restart|stop} vncserver@1`.
+
 ## Layout
 
 ```
@@ -102,6 +135,7 @@ scripts/
   add-client.sh              # add a device (config + QR code)
   remove-client.sh           # revoke a device
   list-clients.sh            # status / re-print QR codes
+  setup-vnc.sh               # optional XFCE remote desktop over VPN/SSH
   lib/common.sh              # shared helpers
 ```
 
