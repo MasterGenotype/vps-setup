@@ -363,6 +363,27 @@ copy_root_filesystem() {
         || warn "Extracted /etc/os-release does not clearly identify Artix Linux"
 }
 
+# pacman's CheckSpace option resolves mount points from /proc/self/mounts to
+# measure free space before a transaction. Inside the chroot that table lists
+# host mounts that do not match the chroot's view of the filesystem (the
+# chroot root is not a mount point, and /run is a small host tmpfs), so
+# `pacman -Syu` aborts with a spurious "Partition ... too full" error even
+# when the target has plenty of space. Disable the check; writes still fail
+# cleanly if the disk genuinely fills up.
+disable_pacman_checkspace() {
+    local pacman_conf="${TARGET}/etc/pacman.conf"
+
+    if [[ ! -f ${pacman_conf} ]]; then
+        warn "No pacman.conf found at ${pacman_conf}; skipping CheckSpace adjustment"
+        return 0
+    fi
+
+    if grep -Eq '^[[:space:]]*CheckSpace([[:space:]]|$)' "${pacman_conf}"; then
+        sed -i -E 's/^[[:space:]]*(CheckSpace)/#\1/' "${pacman_conf}"
+        log "Disabled pacman CheckSpace in ${pacman_conf} (unreliable inside a chroot)"
+    fi
+}
+
 prepare_resolver() {
     local source="/etc/resolv.conf"
 
@@ -431,6 +452,7 @@ enter_chroot() {
     shift
     canonicalize_target "${target_arg}"
     [[ -f ${TARGET}/etc/os-release ]] || die "No prepared root filesystem found at ${TARGET}"
+    disable_pacman_checkspace
     mount_chroot_filesystems
     prepare_resolver
 
@@ -540,6 +562,7 @@ main() {
 
             prepare_target_directory
             copy_root_filesystem
+            disable_pacman_checkspace
             prepare_resolver
             write_metadata "${iso_path}"
             mount_chroot_filesystems

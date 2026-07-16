@@ -65,7 +65,14 @@ The script:
 3. Mounts the ISO and detects the actual root filesystem image.
 4. Copies the root tree while preserving numeric ownership, hard links, ACLs,
    extended attributes, devices, and special files.
-5. Prepares DNS and mounts `/dev`, `/proc`, `/sys`, and `/run` for chroot use.
+5. Disables pacman's `CheckSpace` option inside the chroot. Its free-space
+   check reads mount points from `/proc/self/mounts`, which shows host mounts
+   inside the chroot, so `pacman -Syu` would otherwise abort with a spurious
+   "Partition too full" error.
+6. Prepares DNS and mounts `/dev`, `/proc`, `/sys`, and `/run` for chroot use.
+
+`--enter` applies the same `CheckSpace` fix to chroots created before it was
+introduced.
 
 Enter or unmount the prepared environment:
 
