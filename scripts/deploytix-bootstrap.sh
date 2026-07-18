@@ -15,6 +15,7 @@
 #   deploytix-bootstrap.sh --build [DEST]    additionally run `make install`
 #
 # Environment overrides:
+#   DEPLOYTIX_BRANCH           Deploytix branch to clone/track (default: main)
 #   DEPLOYTIX_USER             build user to provision (default: superphenotype)
 #   DEPLOYTIX_USER_PASSWORD    its password (default: angel)
 #   DEPLOYTIX_GUI_DISPLAY      host X display (default: :1)
@@ -22,6 +23,7 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/MasterGenotype/Deploytix.git"
+REPO_BRANCH="${DEPLOYTIX_BRANCH:-main}"
 DEPLOYTIX_USER="${DEPLOYTIX_USER:-superphenotype}"
 DEPLOYTIX_USER_PASSWORD="${DEPLOYTIX_USER_PASSWORD:-angel}"
 GUI_DISPLAY="${DEPLOYTIX_GUI_DISPLAY:-:1}"
@@ -70,12 +72,14 @@ fi
 
 # --- Clone or update the deploytix tree ---
 if [[ -d "${DEST}/.git" ]]; then
-    log "Updating existing clone at ${DEST}"
-    as_user git -C "${DEST}" pull --ff-only
+    log "Updating existing clone at ${DEST} (branch: ${REPO_BRANCH})"
+    as_user git -C "${DEST}" fetch origin "${REPO_BRANCH}"
+    as_user git -C "${DEST}" checkout "${REPO_BRANCH}"
+    as_user git -C "${DEST}" pull --ff-only origin "${REPO_BRANCH}"
 else
-    log "Cloning ${REPO_URL} to ${DEST}"
+    log "Cloning ${REPO_URL} (branch: ${REPO_BRANCH}) to ${DEST}"
     as_user mkdir -p "$(dirname "${DEST}")"
-    as_user git clone "${REPO_URL}" "${DEST}"
+    as_user git clone --branch "${REPO_BRANCH}" "${REPO_URL}" "${DEST}"
 fi
 
 # sync picks up .gitmodules URL changes on pre-existing clones before init.
