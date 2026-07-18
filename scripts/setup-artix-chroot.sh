@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 #
-# setup-artix-chroot.sh — download an Artix base-runit ISO, locate the live
-# root filesystem inside it, copy that filesystem into a user-selected target,
-# and prepare the target for chroot use.
+# setup-artix-chroot.sh — download the latest Artix base-runit weekly ISO,
+# locate the live root filesystem inside it, copy that filesystem into a
+# user-selected target, and prepare the target for chroot use.
 #
-# Default ISO:
-#   https://download.artixlinux.org/weekly-iso/
-#   artix-base-runit-20260626-x86_64.iso
+# By default the script discovers the newest weekly ISO and its SHA256 from
+# the published manifest:
+#   https://download.artixlinux.org/weekly-iso/sha256sums
+# so it always pulls the current artix-base-runit x86_64 weekly image.
+# Pin a specific image with --iso-url or ARTIX_ISO_URL.
 #
 # Usage:
 #   sudo ./scripts/setup-artix-chroot.sh /srv/chroots/artix
@@ -17,11 +19,15 @@
 
 set -euo pipefail
 
-DEFAULT_ISO_URL="https://download.artixlinux.org/weekly-iso/artix-base-runit-20260626-x86_64.iso"
+WEEKLY_ISO_BASE_URL="${ARTIX_WEEKLY_ISO_BASE_URL:-https://download.artixlinux.org/weekly-iso}"
+WEEKLY_ISO_BASE_URL="${WEEKLY_ISO_BASE_URL%/}"
+ISO_VARIANT="${ARTIX_ISO_VARIANT:-base-runit}"
 DOWNLOAD_PAGE_URL="https://artixlinux.org/download.php"
 CACHE_DIR="${ARTIX_ISO_CACHE_DIR:-/var/cache/vps-setup/artix}"
-ISO_URL="${ARTIX_ISO_URL:-${DEFAULT_ISO_URL}}"
+# Empty means "discover the latest weekly ISO"; set to pin a specific image.
+ISO_URL="${ARTIX_ISO_URL:-}"
 ISO_SHA256="${ARTIX_ISO_SHA256:-}"
+ISO_SHA256_SOURCE="ARTIX_ISO_SHA256"
 HTTP_USER_AGENT="${ARTIX_HTTP_USER_AGENT:-Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36}"
 REFRESH=0
 FORCE=0
@@ -47,7 +53,7 @@ Usage:
   setup-artix-chroot.sh --unmount TARGET
 
 Options:
-  --iso-url URL     Override the Artix ISO URL.
+  --iso-url URL     Use a specific ISO instead of the latest weekly image.
   --cache-dir DIR   Store the ISO and signature in DIR.
   --refresh         Re-download the ISO even when a cached copy exists.
   --force           Replace the contents of a non-empty TARGET.
@@ -55,8 +61,15 @@ Options:
   --unmount         Unmount /run, /sys, /proc and /dev below TARGET.
   -h, --help        Show this help.
 
+Without --iso-url the script reads the sha256sums manifest below the weekly
+ISO directory, picks the newest artix-base-runit x86_64 image, and verifies
+the download against the checksum published in the same manifest.
+
 Environment overrides:
-  ARTIX_ISO_URL
+  ARTIX_ISO_URL              Pin a specific ISO URL (skips weekly discovery).
+  ARTIX_WEEKLY_ISO_BASE_URL  Weekly ISO directory
+                             (default: https://download.artixlinux.org/weekly-iso).
+  ARTIX_ISO_VARIANT          Weekly image variant (default: base-runit).
   ARTIX_ISO_CACHE_DIR
   ARTIX_ISO_SHA256
   ARTIX_HTTP_USER_AGENT
@@ -163,6 +176,56 @@ checksum_from_url() {
     printf '%s' "${checksum}"
 }
 
+# Construct the URL of the current weekly ISO. The weekly directory publishes
+# a sha256sums manifest next to the images, so one fetch yields both the
+# newest filename and its checksum. The dates are fixed-width (YYYYMMDD) and
+# the rest of the filename is constant for a given variant, so a plain sort
+# on the filename orders the entries chronologically.
+discover_weekly_iso() {
+    local manifest="${WORK_DIR}/weekly-sha256sums"
+    local index="${WORK_DIR}/weekly-index.html"
+    local name_pattern="artix-${ISO_VARIANT}-[0-9]{8}-x86_64\.iso"
+    local entry iso_name
+
+    log "Discovering the latest ${ISO_VARIANT} weekly ISO from ${WEEKLY_ISO_BASE_URL}/"
+
+    if curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+        --retry-delay 2 --user-agent "${HTTP_USER_AGENT}" \
+        --output "${manifest}" "${WEEKLY_ISO_BASE_URL}/sha256sums"; then
+        entry="$(grep -Eo "[[:xdigit:]]{64}[[:space:]]+\*?${name_pattern}" \
+            "${manifest}" | sort -k2,2 | tail -n1 || true)"
+        if [[ -n ${entry} ]]; then
+            iso_name="$(awk '{print $NF}' <<<"${entry}")"
+            iso_name="${iso_name#\*}"
+            ISO_URL="${WEEKLY_ISO_BASE_URL}/${iso_name}"
+            if [[ -z ${ISO_SHA256} ]]; then
+                ISO_SHA256="$(awk '{print tolower($1)}' <<<"${entry}")"
+                ISO_SHA256_SOURCE="${WEEKLY_ISO_BASE_URL}/sha256sums"
+            fi
+            log "Latest weekly ISO: ${iso_name}"
+            return 0
+        fi
+        warn "No artix-${ISO_VARIANT} x86_64 entries in ${WEEKLY_ISO_BASE_URL}/sha256sums"
+    else
+        warn "Could not download ${WEEKLY_ISO_BASE_URL}/sha256sums"
+    fi
+
+    # The manifest was unusable; fall back to scraping the directory index.
+    # Verification then relies on verify_iso finding a published checksum.
+    if curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+        --retry-delay 2 --user-agent "${HTTP_USER_AGENT}" \
+        --output "${index}" "${WEEKLY_ISO_BASE_URL}/"; then
+        iso_name="$(grep -Eo "${name_pattern}" "${index}" | sort -u | tail -n1 || true)"
+        if [[ -n ${iso_name} ]]; then
+            ISO_URL="${WEEKLY_ISO_BASE_URL}/${iso_name}"
+            log "Latest weekly ISO (from directory index): ${iso_name}"
+            return 0
+        fi
+    fi
+
+    die "Unable to discover the latest weekly ISO below ${WEEKLY_ISO_BASE_URL}/. Pass --iso-url (or set ARTIX_ISO_URL) to pin one explicitly."
+}
+
 verify_iso() {
     local iso_path="$1" iso_name="$2" sig_path="$3"
     local expected actual gpg_home checksum_source manifest_url
@@ -173,8 +236,8 @@ verify_iso() {
     if [[ -n ${ISO_SHA256} ]]; then
         expected="${ISO_SHA256,,}"
         [[ ${expected} =~ ^[0-9a-f]{64}$ ]] \
-            || die "ARTIX_ISO_SHA256 must contain exactly 64 hexadecimal characters"
-        checksum_source="ARTIX_ISO_SHA256"
+            || die "The expected SHA256 must contain exactly 64 hexadecimal characters (source: ${ISO_SHA256_SOURCE})"
+        checksum_source="${ISO_SHA256_SOURCE}"
     else
         expected="$(checksum_from_url "${manifest_url}" "${iso_name}" \
             "${WORK_DIR}/sha256sums" || true)"
@@ -197,7 +260,7 @@ verify_iso() {
         return 0
     fi
 
-    if [[ ${ISO_URL} == */weekly-iso/* ]]; then
+    if [[ ${ISO_URL} == */weekly-iso/* || ${ISO_URL} == "${WEEKLY_ISO_BASE_URL}"/* ]]; then
         die "Could not obtain the weekly SHA256 for ${iso_name}. Tried ${manifest_url} and ${DOWNLOAD_PAGE_URL}. Set ARTIX_ISO_SHA256 to a trusted published checksum and re-run."
     fi
 
@@ -222,9 +285,13 @@ verify_iso() {
 obtain_iso() {
     local iso_name iso_path sig_path
 
+    if [[ -z ${ISO_URL} ]]; then
+        discover_weekly_iso
+    fi
+
     iso_name="${ISO_URL##*/}"
-    [[ ${iso_name} == artix-base-runit-*-x86_64.iso ]] \
-        || warn "ISO filename is not the expected Artix base-runit x86_64 pattern: ${iso_name}"
+    [[ ${iso_name} == artix-${ISO_VARIANT}-*-x86_64.iso ]] \
+        || warn "ISO filename is not the expected Artix ${ISO_VARIANT} x86_64 pattern: ${iso_name}"
 
     iso_path="${CACHE_DIR}/${iso_name}"
     sig_path="${iso_path}.sig"

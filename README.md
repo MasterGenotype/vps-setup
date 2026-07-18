@@ -45,11 +45,19 @@ internal ISO path: it mounts the ISO read-only, scans filesystem-image
 candidates, validates candidates by looking for a usable Linux root tree, and
 supports one nested filesystem-image layer.
 
-The default source is:
+By default the script constructs the download URL itself: it fetches the
+`sha256sums` manifest from the weekly ISO directory, picks the newest
+`artix-base-runit-YYYYMMDD-x86_64.iso` entry, and uses the checksum published
+alongside it, so every run pulls the current weekly image:
 
 ```text
-https://download.artixlinux.org/weekly-iso/artix-base-runit-20260626-x86_64.iso
+https://download.artixlinux.org/weekly-iso/
 ```
+
+If the manifest is unreachable it falls back to scraping the directory index
+for the newest ISO filename. `--iso-url` (or `ARTIX_ISO_URL`) pins a specific
+image instead, and `ARTIX_ISO_VARIANT` selects a different weekly variant
+(default `base-runit`).
 
 Create a chroot at a user-selected absolute path:
 
@@ -59,9 +67,11 @@ sudo ./scripts/setup-artix-chroot.sh /srv/chroots/artix
 
 The script:
 
-1. Downloads or reuses the cached ISO under `/var/cache/vps-setup/artix/`.
-2. Verifies weekly images against the `sha256sums` manifest published in the
-   same Artix ISO directory. The general downloads page is used as a fallback.
+1. Discovers the latest weekly ISO and its SHA256 from the `sha256sums`
+   manifest, then downloads it or reuses the cached copy under
+   `/var/cache/vps-setup/artix/`.
+2. Verifies weekly images against the checksum published in the same Artix
+   ISO directory. The general downloads page is used as a fallback.
 3. Mounts the ISO and detects the actual root filesystem image.
 4. Copies the root tree while preserving numeric ownership, hard links, ACLs,
    extended attributes, devices, and special files.
