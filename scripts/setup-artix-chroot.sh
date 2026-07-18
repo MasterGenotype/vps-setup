@@ -33,6 +33,11 @@ REFRESH=0
 FORCE=0
 MODE="setup"
 TARGET=""
+# X display / desktop user used to authorize the chroot's deploytix GUI
+# against the host X server. Empty display means "auto-detect from
+# /tmp/.X11-unix"; the user defaults to whoever invoked sudo.
+GUI_DISPLAY="${DEPLOYTIX_GUI_DISPLAY:-}"
+GUI_USER="${DEPLOYTIX_GUI_USER:-${SUDO_USER:-}}"
 
 WORK_DIR=""
 ISO_MOUNT=""
@@ -73,6 +78,10 @@ Environment overrides:
   ARTIX_ISO_CACHE_DIR
   ARTIX_ISO_SHA256
   ARTIX_HTTP_USER_AGENT
+  DEPLOYTIX_GUI_DISPLAY      Host X display to authorize for the chroot's
+                             deploytix GUI (default: auto-detect).
+  DEPLOYTIX_GUI_USER         Desktop session user owning that display
+                             (default: the sudo invoker).
 USAGE
 }
 
@@ -465,10 +474,66 @@ prepare_resolver() {
     install -m 0644 -- "${source}" "${TARGET}/etc/resolv.conf"
 }
 
+# Authorize the chroot's deploytix GUI against the host X server: grant
+# local access for the desktop user and root, and publish the session
+# cookie both on the host (/tmp/hostxauth) and inside the chroot
+# ($TARGET/tmp/hostxauth — the chroot's /tmp is NOT the host's /tmp; only
+# the X socket directory is bind-mounted).
+prepare_deploytix_gui_access() {
+    local socket auth_file user_home
+
+    if [[ -z ${GUI_DISPLAY} ]]; then
+        for socket in /tmp/.X11-unix/X*; do
+            [[ -S ${socket} ]] || continue
+            GUI_DISPLAY=":${socket##*/X}"
+            break
+        done
+    fi
+    if [[ -z ${GUI_DISPLAY} ]]; then
+        warn "No X display found on the host; skipping deploytix GUI access preparation"
+        return 0
+    fi
+    if [[ -z ${GUI_USER} ]] || ! id -u "${GUI_USER}" >/dev/null 2>&1; then
+        warn "Cannot determine the desktop session user (set DEPLOYTIX_GUI_USER); skipping GUI access preparation"
+        return 0
+    fi
+
+    user_home="$(getent passwd "${GUI_USER}" | cut -d: -f6)"
+    auth_file="${user_home}/.Xauthority"
+
+    if runuser -u "${GUI_USER}" -- env DISPLAY="${GUI_DISPLAY}" XAUTHORITY="${auth_file}" \
+        xhost "+SI:localuser:${GUI_USER}" +SI:localuser:root >/dev/null 2>&1; then
+        log "Granted X access on ${GUI_DISPLAY} to ${GUI_USER} and root"
+    else
+        warn "xhost grant on ${GUI_DISPLAY} failed; the chroot GUI may not authenticate"
+    fi
+
+    if [[ -r ${auth_file} ]]; then
+        cp -f -- "${auth_file}" /tmp/hostxauth
+        chmod 644 /tmp/hostxauth
+        if [[ -d ${TARGET}/tmp ]]; then
+            cp -f -- "${auth_file}" "${TARGET}/tmp/hostxauth"
+            chmod 644 "${TARGET}/tmp/hostxauth"
+        fi
+        log "X session cookie published to /tmp/hostxauth (host and chroot)"
+    else
+        warn "No readable ${auth_file}; skipping X cookie copy"
+    fi
+}
+
 mount_chroot_filesystems() {
     local source destination
 
     mkdir -p -- "${TARGET}/dev" "${TARGET}/proc" "${TARGET}/sys" "${TARGET}/run"
+
+    # Expose the host X sockets so GUI programs in the chroot can reach
+    # the display server.
+    if [[ -d /tmp/.X11-unix ]]; then
+        mkdir -p -- "${TARGET}/tmp/.X11-unix"
+        if ! mountpoint -q -- "${TARGET}/tmp/.X11-unix"; then
+            mount --bind /tmp/.X11-unix "${TARGET}/tmp/.X11-unix"
+        fi
+    fi
 
     if ! mountpoint -q -- "${TARGET}/dev"; then
         mount --rbind /dev "${TARGET}/dev"
@@ -492,7 +557,7 @@ unmount_chroot_filesystems() {
     local path
     canonicalize_target "$1"
 
-    for path in run sys proc dev; do
+    for path in tmp/.X11-unix run sys proc dev; do
         if mountpoint -q -- "${TARGET}/${path}"; then
             umount --recursive --lazy -- "${TARGET}/${path}"
         fi
@@ -522,9 +587,15 @@ enter_chroot() {
     disable_pacman_checkspace
     mount_chroot_filesystems
     prepare_resolver
+    prepare_deploytix_gui_access
 
     if (( $# == 0 )); then
         set -- /bin/bash -l
+    fi
+
+    local env_extra=()
+    if [[ -n ${GUI_DISPLAY} ]]; then
+        env_extra+=("DISPLAY=${GUI_DISPLAY}" "XAUTHORITY=/tmp/hostxauth")
     fi
 
     log "Entering ${TARGET}"
@@ -532,6 +603,7 @@ enter_chroot() {
         HOME=/root \
         TERM="${TERM:-xterm}" \
         PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin \
+        ${env_extra[@]+"${env_extra[@]}"} \
         "$@"
 }
 
@@ -633,6 +705,7 @@ main() {
             prepare_resolver
             write_metadata "${iso_path}"
             mount_chroot_filesystems
+            prepare_deploytix_gui_access
 
             log "Artix chroot prepared at ${TARGET}"
             printf '\nEnter it with:\n  sudo %q --enter %q\n' "$0" "${TARGET}"
