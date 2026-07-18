@@ -19,8 +19,9 @@
 
 set -euo pipefail
 
-WEEKLY_ISO_BASE_URL="${ARTIX_WEEKLY_ISO_BASE_URL:-https://download.artixlinux.org/weekly-iso}"
-WEEKLY_ISO_BASE_URL="${WEEKLY_ISO_BASE_URL%/}"
+# Space-separated candidate directories that publish the weekly ISOs and a
+# sha256sums manifest, tried in order until one answers.
+WEEKLY_ISO_BASE_URLS="${ARTIX_WEEKLY_ISO_BASE_URL:-https://download.artixlinux.org/weekly-iso https://iso.artixlinux.org/weekly-iso}"
 ISO_VARIANT="${ARTIX_ISO_VARIANT:-base-runit}"
 DOWNLOAD_PAGE_URL="https://artixlinux.org/download.php"
 CACHE_DIR="${ARTIX_ISO_CACHE_DIR:-/var/cache/vps-setup/artix}"
@@ -67,8 +68,10 @@ the download against the checksum published in the same manifest.
 
 Environment overrides:
   ARTIX_ISO_URL              Pin a specific ISO URL (skips weekly discovery).
-  ARTIX_WEEKLY_ISO_BASE_URL  Weekly ISO directory
-                             (default: https://download.artixlinux.org/weekly-iso).
+  ARTIX_WEEKLY_ISO_BASE_URL  Weekly ISO directories, space-separated, tried
+                             in order (default:
+                             https://download.artixlinux.org/weekly-iso
+                             https://iso.artixlinux.org/weekly-iso).
   ARTIX_ISO_VARIANT          Weekly image variant (default: base-runit).
   ARTIX_ISO_CACHE_DIR
   ARTIX_ISO_SHA256
@@ -143,6 +146,35 @@ install_host_dependencies() {
         ca-certificates curl gnupg dirmngr file rsync squashfs-tools util-linux
 }
 
+# http_fetch URL OUTPUT [extra curl options...]
+#
+# Fetch URL into OUTPUT. Tries the configured (browser-like) User-Agent
+# first; if the server answers 403, retries once with curl's native
+# User-Agent — some CDN bot filters reject spoofed browser agents that lack
+# the other browser headers, while others reject plain curl, so between the
+# two attempts one usually passes. Every failed attempt logs the URL and the
+# HTTP status so the blocked request is identifiable.
+http_fetch() {
+    local url="$1" output="$2"
+    shift 2
+    local ua_mode status curl_args
+
+    for ua_mode in browser curl; do
+        curl_args=(--proto '=https' --tlsv1.2 --fail --location --retry 3
+                   --retry-delay 2 --progress-bar
+                   --write-out '%{http_code}' --output "${output}")
+        if [[ ${ua_mode} == browser ]]; then
+            curl_args+=(--user-agent "${HTTP_USER_AGENT}")
+        fi
+        if status="$(curl "${curl_args[@]}" "$@" "${url}")"; then
+            return 0
+        fi
+        warn "GET ${url} failed (HTTP ${status:-000}, ${ua_mode} user agent)"
+        [[ ${status} == 403 ]] || return 1
+    done
+    return 1
+}
+
 download_file() {
     local url="$1" destination="$2" partial
     partial="${destination}.part"
@@ -150,13 +182,11 @@ download_file() {
     mkdir -p -- "$(dirname -- "${destination}")"
     if [[ -s ${partial} ]]; then
         log "Resuming partial download: ${partial}"
-        curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
-            --retry-delay 2 --user-agent "${HTTP_USER_AGENT}" \
-            --continue-at - --output "${partial}" "${url}"
+        http_fetch "${url}" "${partial}" --continue-at - \
+            || die "Download failed: ${url}"
     else
-        curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
-            --retry-delay 2 --user-agent "${HTTP_USER_AGENT}" \
-            --output "${partial}" "${url}"
+        http_fetch "${url}" "${partial}" \
+            || die "Download failed: ${url}"
     fi
     mv -f -- "${partial}" "${destination}"
 }
@@ -164,11 +194,7 @@ download_file() {
 checksum_from_url() {
     local source_url="$1" iso_name="$2" destination="$3" checksum
 
-    if ! curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
-        --retry-delay 2 --user-agent "${HTTP_USER_AGENT}" \
-        --output "${destination}" "${source_url}"; then
-        return 1
-    fi
+    http_fetch "${source_url}" "${destination}" || return 1
 
     checksum="$(grep -Eo "[[:xdigit:]]{64}[[:space:]]+${iso_name//./\\.}" "${destination}" \
         | awk 'NR == 1 {print tolower($1)}')"
@@ -176,54 +202,68 @@ checksum_from_url() {
     printf '%s' "${checksum}"
 }
 
-# Construct the URL of the current weekly ISO. The weekly directory publishes
+# Construct the URL of the current weekly ISO. The weekly directories publish
 # a sha256sums manifest next to the images, so one fetch yields both the
 # newest filename and its checksum. The dates are fixed-width (YYYYMMDD) and
 # the rest of the filename is constant for a given variant, so a plain sort
 # on the filename orders the entries chronologically.
 discover_weekly_iso() {
-    local manifest="${WORK_DIR}/weekly-sha256sums"
-    local index="${WORK_DIR}/weekly-index.html"
     local name_pattern="artix-${ISO_VARIANT}-[0-9]{8}-x86_64\.iso"
-    local entry iso_name
+    local base manifest_name manifest index entry iso_name fetch_id=0
 
-    log "Discovering the latest ${ISO_VARIANT} weekly ISO from ${WEEKLY_ISO_BASE_URL}/"
+    log "Discovering the latest ${ISO_VARIANT} weekly ISO"
 
-    if curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
-        --retry-delay 2 --user-agent "${HTTP_USER_AGENT}" \
-        --output "${manifest}" "${WEEKLY_ISO_BASE_URL}/sha256sums"; then
-        entry="$(grep -Eo "[[:xdigit:]]{64}[[:space:]]+\*?${name_pattern}" \
-            "${manifest}" | sort -k2,2 | tail -n1 || true)"
-        if [[ -n ${entry} ]]; then
+    for base in ${WEEKLY_ISO_BASE_URLS}; do
+        base="${base%/}"
+        for manifest_name in sha256sums sha256sums.txt; do
+            manifest="${WORK_DIR}/weekly-sums-$((fetch_id++))"
+            http_fetch "${base}/${manifest_name}" "${manifest}" || continue
+            entry="$(grep -Eo "[[:xdigit:]]{64}[[:space:]]+\*?${name_pattern}" \
+                "${manifest}" | sort -k2,2 | tail -n1 || true)"
+            if [[ -z ${entry} ]]; then
+                warn "No artix-${ISO_VARIANT} x86_64 entries in ${base}/${manifest_name}"
+                continue
+            fi
             iso_name="$(awk '{print $NF}' <<<"${entry}")"
             iso_name="${iso_name#\*}"
-            ISO_URL="${WEEKLY_ISO_BASE_URL}/${iso_name}"
+            ISO_URL="${base}/${iso_name}"
             if [[ -z ${ISO_SHA256} ]]; then
                 ISO_SHA256="$(awk '{print tolower($1)}' <<<"${entry}")"
-                ISO_SHA256_SOURCE="${WEEKLY_ISO_BASE_URL}/sha256sums"
+                ISO_SHA256_SOURCE="${base}/${manifest_name}"
             fi
-            log "Latest weekly ISO: ${iso_name}"
+            log "Latest weekly ISO: ${iso_name} (from ${base}/${manifest_name})"
             return 0
-        fi
-        warn "No artix-${ISO_VARIANT} x86_64 entries in ${WEEKLY_ISO_BASE_URL}/sha256sums"
-    else
-        warn "Could not download ${WEEKLY_ISO_BASE_URL}/sha256sums"
-    fi
+        done
+    done
 
-    # The manifest was unusable; fall back to scraping the directory index.
+    # No manifest was usable; fall back to scraping the directory indexes.
     # Verification then relies on verify_iso finding a published checksum.
-    if curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
-        --retry-delay 2 --user-agent "${HTTP_USER_AGENT}" \
-        --output "${index}" "${WEEKLY_ISO_BASE_URL}/"; then
+    for base in ${WEEKLY_ISO_BASE_URLS}; do
+        base="${base%/}"
+        index="${WORK_DIR}/weekly-index-$((fetch_id++)).html"
+        http_fetch "${base}/" "${index}" || continue
         iso_name="$(grep -Eo "${name_pattern}" "${index}" | sort -u | tail -n1 || true)"
-        if [[ -n ${iso_name} ]]; then
-            ISO_URL="${WEEKLY_ISO_BASE_URL}/${iso_name}"
-            log "Latest weekly ISO (from directory index): ${iso_name}"
+        [[ -n ${iso_name} ]] || continue
+        ISO_URL="${base}/${iso_name}"
+        log "Latest weekly ISO (from directory index): ${ISO_URL}"
+        return 0
+    done
+
+    die "Unable to discover the latest weekly ISO (tried: ${WEEKLY_ISO_BASE_URLS}). See the warnings above for the exact URL and HTTP status of each attempt. Pass --iso-url (or set ARTIX_ISO_URL) to pin one explicitly."
+}
+
+# Weekly images rotate out of the download directory, so an unverifiable
+# weekly ISO must be treated as an error rather than falling through to the
+# stable-ISO signature path.
+is_weekly_source() {
+    local base
+    [[ ${ISO_URL} == */weekly-iso/* ]] && return 0
+    for base in ${WEEKLY_ISO_BASE_URLS}; do
+        if [[ ${ISO_URL} == "${base%/}"/* ]]; then
             return 0
         fi
-    fi
-
-    die "Unable to discover the latest weekly ISO below ${WEEKLY_ISO_BASE_URL}/. Pass --iso-url (or set ARTIX_ISO_URL) to pin one explicitly."
+    done
+    return 1
 }
 
 verify_iso() {
@@ -260,16 +300,13 @@ verify_iso() {
         return 0
     fi
 
-    if [[ ${ISO_URL} == */weekly-iso/* || ${ISO_URL} == "${WEEKLY_ISO_BASE_URL}"/* ]]; then
+    if is_weekly_source; then
         die "Could not obtain the weekly SHA256 for ${iso_name}. Tried ${manifest_url} and ${DOWNLOAD_PAGE_URL}. Set ARTIX_ISO_SHA256 to a trusted published checksum and re-run."
     fi
 
     warn "No matching SHA256 was found; trying the detached PGP signature"
-    if ! curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
-        --retry-delay 2 --user-agent "${HTTP_USER_AGENT}" \
-        --output "${sig_path}" "${ISO_URL}.sig"; then
-        die "Could not obtain a checksum or detached signature for ${iso_name}"
-    fi
+    http_fetch "${ISO_URL}.sig" "${sig_path}" \
+        || die "Could not obtain a checksum or detached signature for ${iso_name}"
 
     gpg_home="${WORK_DIR}/gnupg"
     install -d -m 0700 -- "${gpg_home}"

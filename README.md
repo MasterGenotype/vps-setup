@@ -46,18 +46,24 @@ candidates, validates candidates by looking for a usable Linux root tree, and
 supports one nested filesystem-image layer.
 
 By default the script constructs the download URL itself: it fetches the
-`sha256sums` manifest from the weekly ISO directory, picks the newest
+`sha256sums` manifest from the weekly ISO directories, picks the newest
 `artix-base-runit-YYYYMMDD-x86_64.iso` entry, and uses the checksum published
-alongside it, so every run pulls the current weekly image:
+alongside it, so every run pulls the current weekly image. The source
+directories are tried in order:
 
 ```text
 https://download.artixlinux.org/weekly-iso/
+https://iso.artixlinux.org/weekly-iso/
 ```
 
-If the manifest is unreachable it falls back to scraping the directory index
-for the newest ISO filename. `--iso-url` (or `ARTIX_ISO_URL`) pins a specific
-image instead, and `ARTIX_ISO_VARIANT` selects a different weekly variant
-(default `base-runit`).
+Requests that are answered with HTTP 403 are retried with curl's native
+User-Agent (some CDN bot filters reject the spoofed browser agent, others
+reject plain curl), and every failed attempt logs the URL and HTTP status.
+If no manifest is reachable the script falls back to scraping the directory
+indexes for the newest ISO filename. `--iso-url` (or `ARTIX_ISO_URL`) pins a
+specific image instead, `ARTIX_WEEKLY_ISO_BASE_URL` overrides the
+space-separated source list, and `ARTIX_ISO_VARIANT` selects a different
+weekly variant (default `base-runit`).
 
 Create a chroot at a user-selected absolute path:
 
